@@ -138,9 +138,9 @@ pytest                                   # testes, incluindo uma execução ráp
 ruff check . && ruff format --check . && mypy src
 ```
 
-O CI roda os testes no Python 3.10-3.13, uma vez com a versão mais antiga permitida de cada
-dependência direta, lint e tipos, e instala o wheel gerado num ambiente limpo para rodar
-`subjectwise demo --quick`.
+O CI roda os testes no Python 3.10-3.13 (Linux) e nos Python 3.10 e 3.13 (Windows), uma vez com a versão mais
+antiga permitida de cada dependência direta, lint e tipos, e instala o wheel gerado num ambiente limpo (Linux e
+Windows) para rodar `subjectwise demo --quick`.
 
 ## Relacionado
 
