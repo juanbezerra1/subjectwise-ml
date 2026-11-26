@@ -11,10 +11,12 @@ looking at the accuracy; choosing whom to drop after seeing the result inflates 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal
 
 import pandas as pd
 
 from .cv import evaluate
+from .tuning import Grid
 
 
 def leave_group_out(
@@ -28,11 +30,17 @@ def leave_group_out(
     log_features: Sequence[str] = (),
     groups: Sequence[object] | None = None,
     random_state: int = 0,
+    tune: bool = False,
+    grid: Grid | None = None,
+    inner_scheme: Literal["loso", "group_kfold"] = "loso",
+    inner_splits: int = 5,
 ) -> pd.DataFrame:
     """One row for the full cohort and one row per excluded group.
 
     ``delta_points`` is the change of the mean per-subject accuracy, in accuracy points, relative to
     the full cohort. ``groups`` restricts which subjects are dropped (default: all of them).
+    ``tune``, ``grid``, ``inner_scheme`` and ``inner_splits`` are those of
+    :func:`subjectwise.evaluate`, so that the table describes the procedure that was reported.
     """
     everyone = list(pd.unique(df[group]))
     targets = everyone if groups is None else list(groups)
@@ -48,6 +56,10 @@ def leave_group_out(
             normalize=normalize,  # type: ignore[arg-type]
             log_features=log_features,
             random_state=random_state,
+            tune=tune,
+            grid=grid,
+            inner_scheme=inner_scheme,
+            inner_splits=inner_splits,
         )
         return result.summary()
 

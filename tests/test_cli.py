@@ -24,7 +24,12 @@ def test_quick_demo_writes_report_tables_figures_and_summary(tmp_path):
     result = runner.invoke(app, ["demo", "--out", str(out), "--quick"])
     assert result.exit_code == 0, result.output
     report = (out / "report.md").read_text(encoding="utf-8")
-    for heading in ("## 1. Data audit", "## 3. Is it above chance?", "## 7. How many subjects?"):
+    for heading in (
+        "## 1. Data audit",
+        "## 3. Is it above chance?",
+        "## 7. How many subjects?",
+        "## 8. Tuning inside the training subjects",
+    ):
         assert heading in report
     for name in ("schemes", "subjects", "permutation", "calibration", "power"):
         assert (out / "figures" / f"{name}.png").stat().st_size > 1000
@@ -35,11 +40,16 @@ def test_quick_demo_writes_report_tables_figures_and_summary(tmp_path):
         "sensitivity",
         "power",
         "false_positive_check",
+        "tuning",
     ):
         assert (out / "tables" / f"{name}.csv").exists()
     summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
     assert summary["cohort"]["chance"] == 0.25 and summary["quick"] is True
     assert 0.0 < summary["permutation"]["p_value"] <= 1.0
+    tuning = summary["tuning"]
+    assert tuning["n_candidates"] == 12 and tuning["model"] == "svm_rbf"
+    assert tuning["optimism"] == pytest.approx(tuning["inner_accuracy"] - tuning["outer_accuracy"])
+    assert "tuned, inner: what the choice was made on" in report
     cohort = pd.read_csv(out / "toy_cohort.csv")
     assert {"subject", "level", "x", "amp_1", "spec_1"} <= set(cohort.columns)
 
@@ -96,6 +106,70 @@ def test_evaluate_prints_every_section_and_writes_files(toy_csv, tmp_path):
         assert text in result.output
     assert (out / "schemes.csv").exists() and (out / "subjects.png").exists()
     assert (out / "permutation.png").exists() and (out / "sensitivity.csv").exists()
+
+
+def test_evaluate_tune_shows_the_inner_score_next_to_the_outer_one(toy_csv, tmp_path):
+    out = tmp_path / "tuned"
+    result = runner.invoke(
+        app,
+        ["evaluate", toy_csv, "--log-features", "amp_1,amp_2,amp_3,amp_4", "--models", "svm_rbf",
+         "--tune", "--permutations", "2", "--out", str(out)],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    for text in (
+        "nested LOSO",
+        "Nested tuning of svm_rbf",
+        "fixed settings:",
+        "tuned, outer (report it):",
+        "tuned, inner (the choice was made on it):",
+        "optimism of the inner score:",
+        "tuning repeated in every shuffle",
+        "Sensitivity to individual subjects",
+    ):
+        assert text in result.output
+    tuning = pd.read_csv(out / "tuning.csv")
+    assert len(tuning) == 6 and {"held_out", "param_C", "param_gamma", "inner_score"} <= set(
+        tuning.columns
+    )
+    plain = runner.invoke(
+        app,
+        [
+            "evaluate",
+            toy_csv,
+            "--models",
+            "svm_rbf",
+            "--permutations",
+            "0",
+            "--out",
+            str(tmp_path / "p"),
+        ],
+    )
+    assert plain.exit_code == 0 and "Nested tuning" not in plain.output
+    assert not (tmp_path / "p" / "tuning.csv").exists()
+
+
+def test_evaluate_tune_with_a_grouped_inner_loop(toy_csv):
+    result = runner.invoke(
+        app,
+        ["evaluate", toy_csv, "--models", "svm_linear", "--tune", "--inner", "group_kfold",
+         "--inner-splits", "2", "--permutations", "0"],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert "inner group_kfold" in result.output
+
+
+def test_evaluate_tune_refuses_what_it_cannot_tune(toy_csv):
+    lda = runner.invoke(app, ["evaluate", toy_csv, "--models", "lda", "--tune"])
+    assert lda.exit_code == 1 and "default grid" in lda.output
+    inner = runner.invoke(
+        app, ["evaluate", toy_csv, "--models", "svm_rbf", "--tune", "--inner", "kfold"]
+    )
+    assert inner.exit_code == 1 and "--inner" in inner.output
+    folds = runner.invoke(
+        app, ["evaluate", toy_csv, "--models", "svm_rbf", "--tune", "--inner", "group_kfold",
+              "--inner-splits", "1", "--permutations", "0"]
+    )  # fmt: skip
+    assert folds.exit_code == 1 and "inner_splits" in folds.output
 
 
 def test_evaluate_without_permutations_skips_that_step(toy_csv):

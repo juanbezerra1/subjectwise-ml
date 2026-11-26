@@ -26,6 +26,7 @@ from .power import PowerResult, level_x_stats, power_curve
 from .sensitivity import leave_group_out
 from .tables import RESERVED_COLUMNS, infer_features, read_table
 from .toy import toy_cohort, toy_features
+from .tuning import TUNABLE_MODELS, default_grid
 
 try:
     __version__ = version("subjectwise-ml")
@@ -37,6 +38,7 @@ __all__ = [
     "MODEL_LABELS",
     "MODEL_NAMES",
     "RESERVED_COLUMNS",
+    "TUNABLE_MODELS",
     "AuditReport",
     "CorrStat",
     "CorrelationResult",
@@ -50,6 +52,7 @@ __all__ = [
     "calibration_check",
     "compare_schemes",
     "correlation_report",
+    "default_grid",
     "evaluate",
     "fraction_calibrated",
     "infer_features",

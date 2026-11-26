@@ -10,6 +10,7 @@ questions the package answers and writes a report, tables, figures and a summary
 5. what does the correlation with a covariate look like when subjects are respected?
 6. can new, plausible subjects be simulated from a small pilot (calibration)?
 7. how many subjects would be needed (simulation-based power)?
+8. what changes when the SVM's settings are tuned inside the training subjects (nested)?
 """
 
 from __future__ import annotations
@@ -33,6 +34,7 @@ from .permutation import permutation_test
 from .power import level_x_stats, power_curve
 from .sensitivity import leave_group_out
 from .toy import toy_cohort, toy_features
+from .tuning import candidates, default_grid
 
 LABEL, GROUP, COVARIATE = "level", "subject", "x"
 #: Share of the pilot's slopes kept in the power analysis: pilots tend to overstate effects.
@@ -119,10 +121,10 @@ def run_demo(
     df.to_csv(out / "toy_cohort.csv", index=False)
     chance = 1.0 / df[LABEL].nunique()
 
-    log("1/7 auditing the table")
+    log("1/8 auditing the table")
     report = audit(df, features, LABEL, GROUP)
 
-    log("2/7 comparing validation schemes")
+    log("2/8 comparing validation schemes")
     models = ("lda", "svm_rbf")
     schemes = compare_schemes(
         df, features, LABEL, GROUP, models=models, log_features=log_features, random_state=seed
@@ -133,30 +135,30 @@ def run_demo(
         normalize="within_group", log_features=log_features, random_state=seed,
     )  # fmt: skip
 
-    log(f"3/7 permutation test ({size.n_perm} shuffles)")
+    log(f"3/8 permutation test ({size.n_perm} shuffles)")
     perm = permutation_test(
         df, features, LABEL, GROUP, model="lda", normalize="within_group",
         log_features=log_features, n_perm=size.n_perm, seed=seed, n_jobs=n_jobs,
     )  # fmt: skip
 
-    log("4/7 sensitivity to individual subjects")
+    log("4/8 sensitivity to individual subjects")
     sensitivity = leave_group_out(
         df, features, LABEL, GROUP, model="lda", normalize="within_group",
         log_features=log_features, random_state=seed,
     )  # fmt: skip
 
-    log("5/7 correlation with the covariate")
+    log("5/8 correlation with the covariate")
     corr_frame = df.assign(log_amp_1=np.log(df["amp_1"]))
     corr = correlation_report(corr_frame, COVARIATE, "log_amp_1", GROUP)
 
-    log("6/7 fitting the simulated-subject generator and checking its calibration")
+    log("6/8 fitting the simulated-subject generator and checking its calibration")
     generator = HierarchicalGenerator.fit(df, features, GROUP, COVARIATE, log_features=log_features)
     calibration = calibration_check(
         df, features, GROUP, COVARIATE, log_features=log_features, n_sim=size.n_sim, seed=seed
     )
     frac_ok = fraction_calibrated(calibration)
 
-    log("7/7 power analysis by simulation")
+    log("7/8 power analysis by simulation")
     x_stats = level_x_stats(df, LABEL, COVARIATE)
     power = power_curve(
         generator.scale_effect(EFFECT_FACTOR), x_stats,
@@ -165,6 +167,22 @@ def run_demo(
         progress=lambda message: log(f"    power: {message}"),
     )  # fmt: skip
     false_positives = power.false_positive_rates()
+
+    log("8/8 tuning the SVM inside the training subjects")
+    tuned = evaluate(
+        df, features, LABEL, GROUP, model="svm_rbf", scheme="loso", normalize="within_group",
+        log_features=log_features, random_state=seed, tune=True,
+    )  # fmt: skip
+    fixed_svm = float(
+        schemes.loc[
+            (schemes["model"] == "svm_rbf")
+            & (schemes["scheme"] == "loso")
+            & (schemes["normalize"] == "within_group"),
+            "mean_accuracy",
+        ].iloc[0]
+    )
+    assert tuned.tuning is not None and tuned.inner_accuracy is not None
+    n_candidates = len(candidates(default_grid("svm_rbf", len(features))))
 
     # ---------------------------------------------------------------- tables and figures
     tables = out / "tables"
@@ -178,6 +196,7 @@ def run_demo(
     calibration.to_csv(tables / "calibration.csv", index=False)
     power.summary.to_csv(tables / "power.csv", index=False)
     false_positives.to_csv(tables / "false_positive_check.csv", index=False)
+    tuned.tuning.to_csv(tables / "tuning.csv", index=False)
 
     figures = out / "figures"
     viz.save_figure(viz.plot_scheme_comparison(schemes, chance=chance), figures / "schemes.png")
@@ -226,6 +245,14 @@ def run_demo(
         },
         "power": power.summary.to_dict(orient="records"),
         "false_positive_check": false_positives.to_dict(orient="records"),
+        "tuning": {
+            "model": "svm_rbf",
+            "n_candidates": n_candidates,
+            "fixed_accuracy": fixed_svm,
+            "outer_accuracy": tuned.mean_accuracy,
+            "inner_accuracy": tuned.inner_accuracy,
+            "optimism": tuned.optimism,
+        },
     }
     (out / "summary.json").write_text(json.dumps(_jsonable(summary), indent=2), encoding="utf-8")
 
@@ -429,6 +456,51 @@ def run_demo(
                 "false positives (t-test)": ".3f",
             },
         )  # fmt: skip
+        + "\n"
+    )
+
+    add("## 8. Tuning inside the training subjects\n")
+    add(
+        "Everything above used fixed settings. Choosing `C` and `gamma` on the folds that report "
+        "the accuracy would be a second leak, so here the SVM's settings are chosen by "
+        f"leave-one-subject-out *inside* every outer fold, on its training subjects only "
+        f"({n_candidates} candidates; the fixed settings come first and win ties). The held-out "
+        "subject is predicted once, by the model refitted with the settings that won.\n"
+    )
+    add(
+        _md(
+            pd.DataFrame(
+                [
+                    {"score": "fixed settings (LOSO + z-score)", "mean acc. (%)": fixed_svm * 100},
+                    {
+                        "score": "tuned, outer: subjects the choice never saw (report this)",
+                        "mean acc. (%)": tuned.mean_accuracy * 100,
+                    },
+                    {
+                        "score": "tuned, inner: what the choice was made on",
+                        "mean acc. (%)": tuned.inner_accuracy * 100,
+                    },
+                ]
+            ),
+            {"mean acc. (%)": ".1f"},
+        )  # fmt: skip
+        + "\n"
+    )
+    assert tuned.optimism is not None
+    add(
+        f"The inner score is {tuned.optimism * 100:+.1f} points from the outer one: choosing the "
+        "best of several candidates on the same subjects flatters the winner, and that difference "
+        "is what nesting keeps out of the number you report. Settings chosen for each held-out "
+        "subject:\n"
+    )
+    shown_tuning = tuned.tuning.drop(columns=["fold", "n_held_out", "n_train_subjects"]).rename(
+        columns={"held_out": "held-out subject", "outer_accuracy": "outer acc."}
+    )
+    add(
+        _md(
+            shown_tuning,
+            {"inner_score": ".3f", "outer acc.": ".3f", "param_gamma": ".4f", "param_C": "g"},
+        )
         + "\n"
     )
 

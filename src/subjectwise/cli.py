@@ -19,6 +19,7 @@ from .permutation import permutation_test
 from .power import level_x_stats, power_curve
 from .sensitivity import leave_group_out
 from .tables import infer_features, read_table, require_columns, split_names
+from .tuning import TUNABLE_MODELS
 
 app = typer.Typer(
     help="Honest validation for classifiers trained on a handful of subjects.",
@@ -151,6 +152,16 @@ def evaluate(
     normalize: Annotated[
         str, typer.Option(help="Normalisation of the permutation test: none | within_group.")
     ] = "within_group",
+    tune: Annotated[
+        bool,
+        typer.Option(
+            help="Tune the first model's settings inside every training set (nested validation; "
+            f"models with a default grid: {', '.join(TUNABLE_MODELS)}). The permutation test then "
+            "repeats the tuning, which is much slower."
+        ),
+    ] = False,
+    inner: Annotated[str, typer.Option(help="Inner loop of --tune: loso | group_kfold.")] = "loso",
+    inner_splits: Annotated[int, typer.Option(help="Folds of the inner group_kfold.")] = 5,
     permutations: Annotated[int, typer.Option(help="Permutations (0 skips the test).")] = 200,
     seed: SeedOpt = 0,
     jobs: Annotated[int, typer.Option(help="Parallel workers for the permutation test.")] = 1,
@@ -164,6 +175,14 @@ def evaluate(
         _fail(f"unknown model(s) {unknown}; choose from {list(MODEL_NAMES)}")
     if normalize not in ("none", "within_group"):
         _fail("--normalize must be 'none' or 'within_group'")
+    if tune and names[0] not in TUNABLE_MODELS:
+        _fail(
+            f"--tune needs a first model with a default grid ({', '.join(TUNABLE_MODELS)}); "
+            f"{names[0]!r} has none"
+        )
+    if inner not in ("loso", "group_kfold"):
+        _fail("--inner must be 'loso' or 'group_kfold'")
+    nested = {"tune": tune, "inner_scheme": inner, "inner_splits": inner_splits}
 
     report = audit(df, cols, label, group)
     typer.echo(report.format())
@@ -193,27 +212,43 @@ def evaluate(
 
         honest = evaluate_cv(
             df, cols, label, group, model=names[0], scheme="loso", normalize=normalize,  # type: ignore[arg-type]
-            log_features=logs, random_state=seed,
+            log_features=logs, random_state=seed, **nested,  # type: ignore[arg-type]
         )  # fmt: skip
-        typer.echo(f"\nPer-subject accuracy ({names[0]}, LOSO, normalize={normalize}):")
+        how = "nested LOSO" if tune else "LOSO"
+        typer.echo(f"\nPer-subject accuracy ({names[0]}, {how}, normalize={normalize}):")
         _show(honest.per_group())
+        if tune:
+            fixed = evaluate_cv(
+                df, cols, label, group, model=names[0], scheme="loso", normalize=normalize,  # type: ignore[arg-type]
+                log_features=logs, random_state=seed,
+            )  # fmt: skip
+            typer.echo(
+                f"\nNested tuning of {names[0]} (settings chosen by inner {inner} on the training "
+                "subjects only):\n"
+                f"  fixed settings:           {fixed.mean_accuracy:.1%}\n"
+                f"  tuned, outer (report it): {honest.mean_accuracy:.1%}\n"
+                f"  tuned, inner (the choice was made on it): {honest.inner_accuracy:.1%}\n"
+                f"  optimism of the inner score: {honest.optimism * 100:+.1f} points"  # type: ignore[operator]
+            )
+            _show(honest.tuning.drop(columns="fold"))  # type: ignore[union-attr]
         perm = None
         if permutations > 0:
             perm = permutation_test(
                 df, cols, label, group, model=names[0], normalize=normalize, log_features=logs,
-                n_perm=permutations, seed=seed, n_jobs=jobs,
+                n_perm=permutations, seed=seed, n_jobs=jobs, **nested,  # type: ignore[arg-type]
             )  # fmt: skip
             s = perm.summary()
+            again = ", tuning repeated in every shuffle" if tune else ""
             typer.echo(
-                f"\nPermutation test ({permutations} shuffles inside each subject): observed "
-                f"{s['observed']:.1%}, null mean {s['null_mean']:.1%}, null 95th pct "
+                f"\nPermutation test ({permutations} shuffles inside each subject{again}): "
+                f"observed {s['observed']:.1%}, null mean {s['null_mean']:.1%}, null 95th pct "
                 f"{s['null_p95']:.1%}, p = {s['p_value']:.4f}"
             )
         sensitivity = None
         if df[group].nunique() >= 4:
             sensitivity = leave_group_out(
                 df, cols, label, group, model=names[0], normalize=normalize, log_features=logs,
-                random_state=seed,
+                random_state=seed, **nested,  # type: ignore[arg-type]
             )  # fmt: skip
             typer.echo("\nSensitivity to individual subjects:")
             _show(sensitivity)
@@ -224,6 +259,8 @@ def evaluate(
         out.mkdir(parents=True, exist_ok=True)
         schemes.to_csv(out / "schemes.csv", index=False)
         honest.per_group().to_csv(out / "per_subject.csv", index=False)
+        if honest.tuning is not None:
+            honest.tuning.to_csv(out / "tuning.csv", index=False)
         if sensitivity is not None:
             sensitivity.to_csv(out / "sensitivity.csv", index=False)
         chance = 1.0 / df[label].nunique()
