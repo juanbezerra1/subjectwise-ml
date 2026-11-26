@@ -122,3 +122,61 @@ The two tests are shown because people use them, but in this simulation both are
 the mechanism: LOSO folds share most of their training data, and accuracies from a handful of
 subjects are discrete and bounded, both plausible contributors.
 `PowerResult.false_positive_rates()` measures the rates for the pipeline at hand.
+
+## 8. Tuning inside the training subjects (nested validation)
+
+The models run with fixed settings unless you ask otherwise. Choosing `C` or `gamma` on the folds
+that report the accuracy is optimistic, because the settings won *since* they did well on those
+subjects; choosing them with a random inner split brings back the subject leakage that LOSO
+removes. `evaluate(..., tune=True)` nests the choice:
+
+1. The held-out subject (or subjects) of the outer fold is set aside first.
+2. On the remaining **training subjects** an inner cross-validation grouped by subject
+   (`inner_scheme="loso"`, or `"group_kfold"` with `inner_splits` folds) scores every candidate of
+   the grid by the mean, over inner held-out subjects, of their accuracy: the same headline as
+   everywhere else.
+3. The best candidate is refitted on all the training subjects and predicts the held-out subject
+   once.
+
+Ties go to the earliest candidate, and every default grid starts with the fixed default settings,
+so they are kept unless something is clearly better on the training subjects. The default grids
+are `svm_rbf`: `C` in {1, 0.1, 10, 100} x `gamma` in {s, s/10, 10 s}, with `s = 1 / n_features`
+(what scikit-learn's `"scale"` is after the standardisation every model starts with);
+`svm_linear`: `C` in {1, 0.01, 0.1, 10}; `rf`: `min_samples_leaf` in {1, 3, 8} x `max_features`
+in {`"sqrt"`, 0.5}. Any other model, `lda` included, is tuned with an explicit
+`grid={"solver": ["svd", "lsqr"]}`. Only the grouped outer schemes can be tuned, and at least 3
+subjects are needed (2 training subjects for the inner loop).
+
+What is reported. `EvalResult.tuning` has one row per outer fold: the chosen settings
+(`param_*`), their inner score and the outer accuracy. `mean_accuracy` stays the outer one, on
+subjects the choice never saw: that is the number to report. `inner_accuracy` is the mean inner
+score of the chosen settings (each held-out subject weighted once) and `optimism` is
+`inner_accuracy - mean_accuracy`. The two are not an estimate of the same thing: the inner score is
+what the choice was made on, and it is flattered by having picked the best of several candidates.
+On the demo cohort (seed 0, SVM with RBF kernel, LOSO + within-subject z-score) the fixed settings
+give 90.0%, the nested procedure 90.0% (outer) and 91.6% (inner): the tuning found nothing to gain,
+and the inner score overstated it by 1.6 points. On pure noise, picking the best of 12 candidates
+(`tests/test_tuning.py`: 10 cohorts of 6 subjects, 12 rows each, 3 classes) gives an inner score of
+39.9% and an outer one of 30.0%, against a chance level of 33%: a 10-point optimism that the outer
+score does not carry.
+
+The permutation test (`permutation_test(..., tune=True)`) takes its observed score from the nested
+procedure and **repeats the tuning inside every permutation**, on the shuffled labels, so the null
+belongs to the procedure that produced the observed score. In pure-noise checks (6 subjects, 12
+rows each, SVM with RBF kernel, 80 shuffles, 3 cohorts per design) the tuned and the untuned nulls
+were close: with balanced classes the mean was 33.8% against 33.5% and the 95th percentile 44.1%
+against 44.5%; with classes in 60/25/15 proportions, 54.6% against 54.5% and 57.0% against 58.8%.
+So repeating the tuning is not a large correction in those cases; it makes the p-value answer for
+the procedure that was run, and it is what costs time. On 40 noise cohorts of 5 subjects (19
+shuffles each) the tuned test with `svm_linear` called 2 significant at p <= 0.1, where about 4
+are expected
+(`tests/test_tuning.py::test_the_tuned_permutation_test_is_not_liberal_on_pure_noise`).
+
+Cost: a nested evaluation fits `outer folds x inner folds x candidates` models, e.g. 8 x 7 x 12 =
+672 for the demo's SVM (about 1.5 s), and a permutation test repeats that `n_perm + 1` times. Use
+`n_jobs`, fewer permutations, `inner_scheme="group_kfold"` with few folds, or a smaller `grid`;
+the random forest is the slow one.
+
+What nesting does not fix: anything chosen by looking at the outer score (which model, which
+features, which normalisation, which grid) is tuning on the test subjects again. Fix those choices
+before looking, or nest them too.

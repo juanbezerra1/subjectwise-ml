@@ -69,6 +69,7 @@ são tratadas como variáveis).
 subjectwise check    variaveis.csv --label level --group subject
 subjectwise evaluate variaveis.csv --label level --group subject --log-features emg1_rms,emg2_rms
 subjectwise power    variaveis.csv --x force_pct --effect 0.5 --subjects 6,8,10,12 --trials 3,5
+subjectwise evaluate variaveis.csv --models svm_rbf --tune     # ajuste feito dentro dos participantes de treino
 ```
 
 ou em Python:
@@ -93,6 +94,21 @@ perm = sw.permutation_test(
     n_jobs=-1,
 )
 print(perm.summary())
+
+# parâmetros do SVM escolhidos só dentro dos participantes de treino (validação aninhada)
+nested = sw.evaluate(
+    df,
+    features,
+    "level",
+    "subject",
+    model="svm_rbf",
+    normalize="within_group",
+    log_features=["emg1_rms"],
+    tune=True,
+)
+print(nested.mean_accuracy, nested.inner_accuracy, nested.optimism)
+# parâmetros, nota interna e acurácia externa de cada participante deixado de fora:
+print(nested.tuning)
 ```
 
 `examples/quickstart.py` roda o roteiro completo na coorte sintética em cerca de 20 segundos.
@@ -120,6 +136,18 @@ print(perm.summary())
   `examples/false_positive_study.py`. O teste de permutação intra-participante, verificado do mesmo
   modo em 200 estudos nulos, rejeitou 7,0% a α = 0,05 e 10,5% a α = 0,10 (erro de cerca de 2
   pontos): consistente com um teste válido.
+* **O ajuste de parâmetros é aninhado ou vaza.** Escolher `C` ou `gamma` nas mesmas dobras que
+  reportam a acurácia infla o resultado, e escolhê-los com uma divisão interna aleatória traz de
+  volta o vazamento entre participantes. `evaluate(..., tune=True)` escolhe os parâmetros por um
+  leave-one-subject-out interno só com os participantes de treino, então o participante deixado de
+  fora nunca chega a ele (`tests/test_tuning.py` embaralha um participante e confere que o que foi
+  escolhido para ele não muda), e mostra a nota interna ao lado da externa. Na coorte do demo o SVM
+  vai de 90,0% com parâmetros fixos para 90,0% ajustado (externa) e 91,6% (interna); em ruído puro,
+  o melhor de 12 candidatos tira 39,9% por dentro e 30,0% por fora, contra um acaso de 33%. O
+  teste de permutação repete o ajuste em cada embaralhamento (8 dobras externas x 7 internas x 12
+  candidatos = 672 ajustes internos por avaliação no SVM do demo), embora em verificações com
+  ruído o nulo com e sem ajuste tenha saído parecido. Escolhas feitas olhando a nota externa
+  (modelo, variáveis, grade) continuam sendo ajuste nos participantes de teste.
 * **O gerador é um modelo, não a verdade.** É gaussiano, linear na covariável e só reproduz o que o
   piloto mostra. Com `k` participantes no piloto a dispersão entre participantes é incerta
   (`spread_interval()`: de 0,66 a 2,0 vezes para k = 8), e `calibration_check` mede quão bem

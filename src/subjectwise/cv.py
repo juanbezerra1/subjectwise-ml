@@ -24,6 +24,7 @@ from sklearn.model_selection import GroupKFold, LeaveOneGroupOut, StratifiedKFol
 
 from .models import make_model
 from .normalize import within_group_zscore
+from .tuning import Grid, Tuning, fit_predict_tuned, make_tuning
 
 Scheme = Literal["loso", "group_kfold", "kfold"]
 Normalize = Literal["none", "within_group"]
@@ -78,13 +79,28 @@ def _class_array(values: pd.Series) -> np.ndarray:
 
 
 def predict_loso(
-    x: np.ndarray, y: np.ndarray, groups: np.ndarray, *, model: str = "lda", random_state: int = 0
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    *,
+    model: str = "lda",
+    random_state: int = 0,
+    tuning: Tuning | None = None,
 ) -> np.ndarray:
-    """Leave-one-group-out predictions (one model fitted per held-out group)."""
+    """Leave-one-group-out predictions (one model fitted per held-out group).
+
+    With ``tuning`` the settings of every fold are chosen on its training groups only (see
+    :mod:`subjectwise.tuning`).
+    """
     pred = np.empty(len(y), dtype=y.dtype)
     for train, test in LeaveOneGroupOut().split(x, y, groups):
-        pipe = make_model(model, random_state).fit(x[train], y[train])
-        pred[test] = pipe.predict(x[test])
+        if tuning is None:
+            pipe = make_model(model, random_state).fit(x[train], y[train])
+            pred[test] = pipe.predict(x[test])
+        else:
+            pred[test], _ = fit_predict_tuned(
+                x[train], y[train], groups[train], x[test], model, tuning, random_state
+            )
     return pred
 
 
@@ -123,6 +139,7 @@ class EvalResult:
     y_true: np.ndarray
     y_pred: np.ndarray
     groups: np.ndarray
+    tuning: pd.DataFrame | None = None  # one row per outer fold when the settings were tuned
 
     @property
     def labels(self) -> list[str]:
@@ -174,8 +191,29 @@ class EvalResult:
         cm = confusion_matrix(self.y_true, self.y_pred, labels=native)
         return pd.DataFrame(cm, index=pd.Index(names, name="true"), columns=names)
 
+    @property
+    def inner_accuracy(self) -> float | None:
+        """Mean inner score of the settings that were chosen, every held-out subject counted once.
+
+        ``None`` unless the settings were tuned. It is the accuracy the chosen settings reached on
+        the *training* subjects, which is what the choice was made on; the outer accuracy
+        (:attr:`mean_accuracy`) is what they reach on subjects the choice never saw.
+        """
+        if self.tuning is None:
+            return None
+        weights = self.tuning["n_held_out"].to_numpy(dtype=float)
+        return float(np.average(self.tuning["inner_score"].to_numpy(dtype=float), weights=weights))
+
+    @property
+    def optimism(self) -> float | None:
+        """``inner_accuracy - mean_accuracy``: how much the choice flatters itself (``None`` if
+        the settings were not tuned). Positive values are the optimism that nesting removes from
+        the reported number."""
+        inner = self.inner_accuracy
+        return None if inner is None else inner - self.mean_accuracy
+
     def summary(self) -> dict[str, float]:
-        return {
+        out = {
             "mean_accuracy": self.mean_accuracy,
             "sd_accuracy": self.sd_accuracy,
             "pooled_accuracy": self.pooled_accuracy,
@@ -183,6 +221,10 @@ class EvalResult:
             "f1_macro": self.f1_macro,
             "n_groups": float(len(np.unique(self.groups.astype(str)))),
         }
+        inner = self.inner_accuracy
+        if inner is not None:  # only a tuned result has the extra entry
+            out["inner_accuracy"] = inner
+        return out
 
 
 def _splits(
@@ -212,6 +254,10 @@ def evaluate(
     log_features: Sequence[str] = (),
     n_splits: int = 5,
     random_state: int = 0,
+    tune: bool = False,
+    grid: Grid | None = None,
+    inner_scheme: Literal["loso", "group_kfold"] = "loso",
+    inner_splits: int = 5,
 ) -> EvalResult:
     """Cross-validate ``model`` on a table whose rows belong to groups (subjects).
 
@@ -226,21 +272,58 @@ def evaluate(
         optimistic naive validation is; do not report it as performance.
 
     For the grouped schemes the function checks that no group lands on both sides of a split.
+
+    Tuning
+    ------
+    With ``tune=True`` the settings of ``model`` are chosen *inside* every outer fold: ``svm_rbf``,
+    ``svm_linear`` and ``rf`` have a default grid, and any model takes an explicit
+    ``grid={"C": [0.1, 1, 10]}``. The inner loop is ``inner_scheme`` (leave-one-subject-out, or
+    ``group_kfold`` with ``inner_splits`` folds) over the training subjects only; the held-out
+    subjects never reach it. The result's ``tuning`` table lists, per outer fold, the chosen
+    settings, their inner score and the outer accuracy; ``inner_accuracy`` and ``optimism``
+    summarise it. Only the grouped schemes can be tuned.
     """
     x, y, groups = prepare(
         df, features, label, group, normalize=normalize, log_features=log_features
     )
+    tuning = make_tuning(
+        model, tune=tune, grid=grid, inner_scheme=inner_scheme, inner_splits=inner_splits
+    )
+    if tuning is not None and scheme == "kfold":
+        raise ValueError("tuning needs a grouped scheme: use scheme='loso' or 'group_kfold'")
+    splits = list(_splits(scheme, x, y, groups, n_splits, random_state))
+    if tuning is not None and any(len(set(groups[tr].tolist())) < 2 for tr, _ in splits):
+        raise ValueError("tuning needs at least 2 training subjects in every fold (3 in all)")
     pred = np.empty(len(y), dtype=y.dtype)
-    for train, test in _splits(scheme, x, y, groups, n_splits, random_state):
+    folds: list[dict[str, object]] = []
+    for train, test in splits:
         if scheme != "kfold":
             shared = set(groups[train].tolist()) & set(groups[test].tolist())
             if shared:
                 raise AssertionError(f"group leakage between train and test: {sorted(shared)}")
-        pipe = make_model(model, random_state).fit(x[train], y[train])
-        pred[test] = pipe.predict(x[test])
+        if tuning is None:
+            pipe = make_model(model, random_state).fit(x[train], y[train])
+            pred[test] = pipe.predict(x[test])
+            continue
+        pred[test], choice = fit_predict_tuned(
+            x[train], y[train], groups[train], x[test], model, tuning, random_state
+        )
+        held_out = sorted({str(g) for g in groups[test].tolist()})
+        folds.append(
+            {
+                "fold": len(folds) + 1,
+                "held_out": ", ".join(held_out),
+                "n_held_out": len(held_out),
+                "n_train_subjects": len(set(groups[train].tolist())),
+                **{f"param_{name}": value for name, value in choice.params.items()},
+                "inner_score": choice.score,
+                "outer_accuracy": float(group_accuracies(y[test], pred[test], groups[test]).mean()),
+            }
+        )
     return EvalResult(
-        scheme=scheme, model=model, normalize=normalize, y_true=y, y_pred=pred, groups=groups
-    )
+        scheme=scheme, model=model, normalize=normalize, y_true=y, y_pred=pred, groups=groups,
+        tuning=pd.DataFrame(folds) if tuning is not None else None,
+    )  # fmt: skip
 
 
 def compare_schemes(

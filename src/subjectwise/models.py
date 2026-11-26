@@ -6,6 +6,8 @@ is fitted on the training fold only and nothing about the held-out subject leaks
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -24,8 +26,14 @@ MODEL_LABELS = {
 }
 
 
-def make_model(name: str, random_state: int = 0) -> Pipeline:
-    """Return an unfitted ``scaler -> classifier`` pipeline for one of :data:`MODEL_NAMES`."""
+def make_model(
+    name: str, random_state: int = 0, params: Mapping[str, object] | None = None
+) -> Pipeline:
+    """Return an unfitted ``scaler -> classifier`` pipeline for one of :data:`MODEL_NAMES`.
+
+    ``params`` overrides parameters of the classifier (``{"C": 10.0}``), which is how the tuning
+    loop tries its candidates.
+    """
     if name == "lda":
         clf = LinearDiscriminantAnalysis()
     elif name == "svm_rbf":
@@ -38,4 +46,6 @@ def make_model(name: str, random_state: int = 0) -> Pipeline:
         clf = LogisticRegression(max_iter=1000)
     else:
         raise ValueError(f"unknown model {name!r}; choose from {MODEL_NAMES}")
+    if params:
+        clf.set_params(**params)
     return Pipeline([("scale", StandardScaler()), ("clf", clf)])
