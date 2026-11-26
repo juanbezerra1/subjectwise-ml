@@ -21,6 +21,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from .cv import _balanced, group_accuracies, predict_loso, prepare
+from .tuning import Grid, Tuning, make_tuning
 
 Metric = Literal["mean_accuracy", "balanced_accuracy"]
 
@@ -49,6 +50,7 @@ class PermutationResult:
     metric: str
     observed: float
     null: np.ndarray
+    tuned: bool = False  # the null repeats the tuning of the observed score
 
     @property
     def n_perm(self) -> int:
@@ -78,11 +80,17 @@ class PermutationResult:
 
 
 def _one_permutation(
-    x: np.ndarray, y: np.ndarray, groups: np.ndarray, model: str, metric: str, seed: int
+    x: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+    model: str,
+    metric: str,
+    seed: int,
+    tuning: Tuning | None = None,
 ) -> float:
     rng = np.random.default_rng(seed)
     y_perm = permute_within_groups(y, groups, rng)
-    pred = predict_loso(x, y_perm, groups, model=model)
+    pred = predict_loso(x, y_perm, groups, model=model, tuning=tuning)
     return _score(metric, y_perm, pred, groups)
 
 
@@ -99,21 +107,40 @@ def permutation_test(
     n_perm: int = 500,
     seed: int = 0,
     n_jobs: int = 1,
+    tune: bool = False,
+    grid: Grid | None = None,
+    inner_scheme: Literal["loso", "group_kfold"] = "loso",
+    inner_splits: int = 5,
 ) -> PermutationResult:
     """Leave-one-subject-out score and its within-subject permutation null.
 
     The normalisation never uses labels, so it is applied once; only the labels are shuffled.
     Each permutation draws from its own child seed, which makes the result independent of
     ``n_jobs``. With ``n_perm`` permutations the smallest attainable p-value is ``1/(n_perm+1)``.
+
+    With ``tune=True`` (see :func:`subjectwise.evaluate`) the observed score comes from the nested
+    procedure and **every permutation repeats the tuning** on its shuffled labels, so the null
+    belongs to the procedure that was actually run. That multiplies the work by the size of the grid
+    and the number of training subjects: use few permutations, ``n_jobs`` or a small ``grid``.
     """
     if metric not in ("mean_accuracy", "balanced_accuracy"):
         raise ValueError("metric must be 'mean_accuracy' or 'balanced_accuracy'")
+    tuning = make_tuning(
+        model, tune=tune, grid=grid, inner_scheme=inner_scheme, inner_splits=inner_splits
+    )
     x, y, groups = prepare(
         df, features, label, group, normalize=normalize, log_features=log_features
     )
-    observed = _score(metric, y, predict_loso(x, y, groups, model=model), groups)
+    if tuning is not None and len(set(groups.tolist())) < 3:
+        raise ValueError("tuning needs at least 3 subjects")
+    observed = _score(metric, y, predict_loso(x, y, groups, model=model, tuning=tuning), groups)
     seeds = np.random.default_rng(seed).integers(0, 2**32 - 1, size=n_perm)
     null = Parallel(n_jobs=n_jobs)(
-        delayed(_one_permutation)(x, y, groups, model, metric, int(s)) for s in seeds
+        delayed(_one_permutation)(x, y, groups, model, metric, int(s), tuning) for s in seeds
     )
-    return PermutationResult(metric=metric, observed=observed, null=np.asarray(null, dtype=float))
+    return PermutationResult(
+        metric=metric,
+        observed=observed,
+        null=np.asarray(null, dtype=float),
+        tuned=tuning is not None,
+    )

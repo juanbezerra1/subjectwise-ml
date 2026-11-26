@@ -68,6 +68,7 @@ treated as features).
 subjectwise check    features.csv --label level --group subject
 subjectwise evaluate features.csv --label level --group subject --log-features emg1_rms,emg2_rms
 subjectwise power    features.csv --x force_pct --effect 0.5 --subjects 6,8,10,12 --trials 3,5
+subjectwise evaluate features.csv --models svm_rbf --tune     # settings chosen inside the training subjects
 ```
 
 or from Python:
@@ -92,6 +93,21 @@ perm = sw.permutation_test(
     n_jobs=-1,
 )
 print(perm.summary())
+
+# SVM settings chosen inside the training subjects only (nested validation)
+nested = sw.evaluate(
+    df,
+    features,
+    "level",
+    "subject",
+    model="svm_rbf",
+    normalize="within_group",
+    log_features=["emg1_rms"],
+    tune=True,
+)
+print(nested.mean_accuracy, nested.inner_accuracy, nested.optimism)
+# settings, inner score and outer accuracy of every held-out subject:
+print(nested.tuning)
 ```
 
 `examples/quickstart.py` runs the whole tour on the synthetic cohort in about 20 seconds.
@@ -118,6 +134,17 @@ print(perm.summary())
   Reproduce with `examples/false_positive_study.py`. The within-subject permutation test, checked
   the same way on 200 null studies, rejected 7.0% at α = 0.05 and 10.5% at α = 0.10 (SE about 2
   points): consistent with a valid test.
+* **Tuning is nested or it leaks.** Choosing `C` or `gamma` on the folds that report the accuracy
+  flatters the result, and choosing them with a random inner split brings the subject leakage back.
+  `evaluate(..., tune=True)` picks the settings by an inner leave-one-subject-out on the training
+  subjects only, so the held-out subject never reaches it (`tests/test_tuning.py` scrambles a
+  subject and checks that what was chosen for it does not change), and reports the inner score next
+  to the outer one. On the demo cohort the SVM goes 90.0% fixed, 90.0% tuned (outer), 91.6% inner;
+  on pure noise, the best of 12 candidates scores 39.9% inside and 30.0% outside against a chance
+  of 33%. The permutation test repeats the tuning in every shuffle (8 outer x 7 inner folds x 12
+  candidates = 672 inner fits per evaluation for the demo SVM), though in noise checks the tuned
+  and the untuned nulls came out close. Choices made by looking at the outer score (model,
+  features, grid) are still tuning on the test subjects.
 * **The generator is a model, not the truth.** It is Gaussian, linear in the covariate and can only
   reproduce what the pilot shows. With `k` pilot subjects the between-subject spread is uncertain
   (`spread_interval()`: about 0.66-2.0 times for k = 8), and `calibration_check` measures how well
